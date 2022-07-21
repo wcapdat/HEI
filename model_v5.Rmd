@@ -1,0 +1,225 @@
+---
+title: "model"
+author: "Jonathan Zhu"
+date: "5/24/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidymodels)
+library(tidyverse)
+library(janitor)
+library(skimr)
+library(rpart)
+library(rpart.plot)
+
+mycores <- parallel::detectCores(logical = FALSE)
+library(doMC)
+registerDoMC(cores = mycores)
+
+load("xgboost_v5.Rdata")
+```
+
+```{r}
+set.seed(13)
+hei_data <- read.csv("hei_assessor_predict.csv")
+hei_data <- clean_names(hei_data)
+hei_data <- mutate(hei_data, risk = as.factor(risk))
+hei_data$risk <- fct_relevel(hei_data$risk, c("low", "moderate", "high"))
+hei_data <- mutate(hei_data, taxcode = as.factor(taxcode))
+#hei_folds <- vfold_cv(hei_data, v = 5, strata = class)
+hei_split <- initial_split(hei_data, prop = 0.8)
+hei_train <- training(hei_split)
+hei_test <- testing(hei_split)
+hei_bootstrap <- bootstraps(data = hei_train, times = 15, strata = risk)
+
+hei_train_counts <- hei_train %>% count(risk)
+
+#decision tree
+hei_train_dt <- hei_train %>% select(!(x | description | pin | address | city | assessment_phase | half_baths | central_air | number_of_fireplaces | next_scheduled_reassessment | use | garage | exterior_construction | taxcode))
+
+fit <- rpart(risk ~., data = hei_train_dt, method = 'class')
+rpart.plot(fit, extra = 106)
+
+accuracy_tune <- function(fit) {
+  cost_matrix <- matrix(c(0, 1.4881, 6.1142, 0.3628, 0, 2.2286, 1.0698, 0.3194, 0), 3, 3)
+  predict_risk <- predict(fit, hei_test, type = 'class')
+  table_mat <- table(hei_test$risk, predict_risk)
+  upper_mat <- table_mat
+  upper_mat[lower.tri(upper_mat)] <- 0
+  accuracy_Test <- sum(diag(table_mat)) / sum(table_mat)
+  underpred_Test <- sum(upper_mat) / sum(table_mat)
+  costmat_Test <- sum(diag(cost_matrix %*% t(table_mat)))
+  print(paste('Accuracy for test: ', accuracy_Test))
+  print(paste("Underprediction Metric: ", underpred_Test))
+  print(paste("Cost Matrix Metric: ", costmat_Test))
+}
+accuracy_tune(fit)
+
+control_params <- rpart.control(minsplit = 14,
+    minbucket = round(14 / 3),
+    maxdepth = 10,
+    cp = 0)
+tune_fit <- rpart(risk~., data = hei_train_dt, method = 'class', control = control_params)
+accuracy_tune(tune_fit)
+rpart.plot(tune_fit, extra = 106)
+
+predict_list <- predict(tune_fit, hei_test, type = 'class')
+predict_probs <- predict(tune_fit, hei_test, type = 'prob')
+
+#trying decision tree the parsnip method
+dt_mod <- decision_tree(cost_complexity = tune(), min_n = tune(), tree_depth = tune()) %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+dt_workflow <- workflow() %>%
+  add_recipe(hei_rec) %>%
+  add_model(dt_mod)
+
+dt_tuning_grid <- grid_max_entropy(extract_parameter_set_dials(dt_mod), size = 100)
+hei_dt <- dt_workflow %>%
+  tune_grid(resamples = hei_bootstrap, grid = dt_tuning_grid)
+
+dt_metrics <- collect_metrics(hei_dt)
+
+best_acc_dt <- hei_dt %>% select_best("accuracy")
+
+hei_dt_fit <- finalize_workflow(dt_workflow, best_acc_dt) %>%
+  fit(data = hei_train)
+
+hei_augmented_dt <- parsnip::augment(hei_dt_fit, new_data = hei_test)
+
+roc_auc(data = hei_augmented_dt, truth = risk, estimator = "hand_till", estimate = c(.pred_high, .pred_low, .pred_moderate))
+accuracy(data = hei_augmented_dt, truth = risk, estimate = .pred_class)
+```
+
+```{r}
+#consider normalizing the variables
+#consider why we put each variable in
+hei_rec <- recipe(risk ~., data = hei_train) %>%
+  step_rm(x, description, pin, address, city, assessment_phase, taxcode, half_baths, central_air, number_of_fireplaces, next_scheduled_reassessment, use, garage, homeowner_2020, senior_2020, senior_freeze_2020, homeowner_2019, senior_2019, senior_freeze_2019, homeowner_2018, senior_2018, senior_freeze_2018) %>%
+  step_dummy(all_nominal_predictors())
+
+hei_baked <- bake(prep(hei_rec), new_data = NULL)
+  
+nn_model <- mlp(hidden_units = tune(), penalty = tune(), epochs = tune()) %>%
+  set_engine("nnet") %>%
+  set_mode("classification")
+
+nn_workflow <- workflow() %>%
+  add_recipe(hei_rec) %>%
+  add_model(nn_model)
+
+nn_tuning_grid <- crossing(hidden_units = 1:5, penalty = seq(0.001, 0.1, length = 6), epochs = c(1000))
+hei_neural <- nn_workflow %>%
+  tune_grid(resamples = hei_bootstrap, grid = nn_tuning_grid)
+
+#nn_metrics <- collect_metrics(hei_neural)
+
+best_acc_nn <- hei_neural %>% select_best("accuracy")
+
+hei_neural_fit <- finalize_workflow(nn_workflow, best_acc_nn) %>%
+  fit(data = hei_train)
+
+hei_augmented_nn <- parsnip::augment(hei_neural_fit, new_data = hei_test)
+
+roc_auc(data = hei_augmented_nn, truth = risk, estimator = "hand_till", estimate = c(.pred_high, .pred_low, .pred_moderate))
+accuracy(data = hei_augmented_nn, truth = risk, estimate = .pred_class)
+```
+
+```{r}
+svm_rad_mod <- svm_rbf(cost = tune(), margin = tune(), rbf_sigma = tune()) %>%
+  set_engine("kernlab") %>%
+  set_mode("classification")
+
+svm_workflow <- workflow() %>%
+  add_recipe(hei_rec) %>%
+  add_model(svm_rad_mod)
+
+svm_rad_tuning_grid <- grid_max_entropy(extract_parameter_set_dials(svm_rad_mod), size = 30)
+hei_svm <- svm_workflow %>%
+  tune_grid(resamples = hei_bootstrap, grid = svm_rad_tuning_grid)
+
+#svm_metrics <- collect_metrics(hei_svm)
+
+best_acc_svm <- hei_svm %>% select_best("accuracy")
+
+hei_svm_fit <- finalize_workflow(svm_workflow, best_acc_svm) %>%
+  fit(data = hei_train)
+
+hei_augmented_svm <- parsnip::augment(hei_svm_fit, new_data = hei_test)
+
+roc_auc(data = hei_augmented_svm, truth = risk, estimator = "hand_till", estimate = c(.pred_high, .pred_low, .pred_moderate))
+accuracy(data = hei_augmented_svm, truth = risk, estimate = .pred_class)
+```
+
+```{r}
+randomforest_model <- rand_forest(mtry = tune(), min_n = tune(), trees = tune()) %>%
+  set_engine('ranger') %>%
+  set_mode('classification')
+
+#creates a workflow with the random forest model and the previous recipe
+randomforest_workflow <- workflow() %>%
+  add_recipe(hei_rec) %>%
+  add_model(randomforest_model)
+#creates a tuning grid for the random forest
+randomforest_params <- randomforest_model %>% 
+   extract_parameter_set_dials() %>% 
+   finalize(x = hei_data %>% select(risk))
+randomforest_tuning_grid <- grid_max_entropy(randomforest_params, size = 30)
+randomforest_tuned <- randomforest_workflow %>%
+  tune_grid(resamples = hei_bootstrap, grid = randomforest_tuning_grid)
+
+randfor_metrics <- collect_metrics(randomforest_tuned)
+
+best_acc_rf <- randomforest_tuned %>% select_best("accuracy")
+
+hei_rf_fit <- finalize_workflow(randomforest_workflow, best_acc_rf) %>%
+  fit(data = hei_train)
+
+hei_augmented_rf <- parsnip::augment(hei_rf_fit, new_data = hei_test)
+
+roc_auc(data = hei_augmented_rf, truth = risk, estimator = "hand_till", estimate = c(.pred_high, .pred_low, .pred_moderate))
+accuracy(data = hei_augmented_rf, truth = risk, estimate = .pred_class)
+
+save.image("randfor_ap.Rdata")
+```
+
+```{r}
+xgboost_mod <-
+  boost_tree(tree_depth = tune(), 
+             trees = tune(), 
+             learn_rate = tune(), 
+             min_n = tune(), 
+             loss_reduction = tune(), 
+             sample_size = tune(), 
+             stop_iter = tune()) %>%
+  set_engine('xgboost') %>%
+  set_mode('classification')
+
+#defines the XG Boost workflow with the XG boost model and standard recipe
+xgboost_workflow <- workflow() %>%
+  add_recipe(hei_rec) %>%
+  add_model(xgboost_mod)
+
+#creates a tuning grid of all the parameters and tests them on the resamples
+xgboost_tuning_grid <- grid_max_entropy(extract_parameter_set_dials(xgboost_mod), size = 200)
+hei_xgboost <- xgboost_workflow %>%
+  tune_grid(resamples = hei_bootstrap, grid = xgboost_tuning_grid)
+
+xgboost_metrics <- collect_metrics(hei_xgboost)
+
+best_acc_xg <- hei_xgboost %>% select_best("accuracy")
+
+hei_xg_fit <- finalize_workflow(xgboost_workflow, best_acc_xg) %>%
+  fit(data = hei_train)
+
+hei_augmented_xg <- parsnip::augment(hei_xg_fit, new_data = hei_test)
+
+roc_auc(data = hei_augmented_xg, truth = risk, estimator = "hand_till", estimate = c(.pred_high, .pred_low, .pred_moderate))
+accuracy(data = hei_augmented_xg, truth = risk, estimate = .pred_class)
+
+save.image("xgboost_v5.Rdata")
+```
+
